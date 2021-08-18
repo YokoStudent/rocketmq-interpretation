@@ -18,6 +18,16 @@ package org.apache.rocketmq.store;
 
 import com.sun.jna.NativeLong;
 import com.sun.jna.Pointer;
+import org.apache.rocketmq.common.UtilAll;
+import org.apache.rocketmq.common.constant.LoggerName;
+import org.apache.rocketmq.common.message.MessageExt;
+import org.apache.rocketmq.common.message.MessageExtBatch;
+import org.apache.rocketmq.logging.InternalLogger;
+import org.apache.rocketmq.logging.InternalLoggerFactory;
+import org.apache.rocketmq.store.config.FlushDiskType;
+import org.apache.rocketmq.store.util.LibC;
+import sun.nio.ch.DirectBuffer;
+
 import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.IOException;
@@ -31,38 +41,58 @@ import java.security.AccessController;
 import java.security.PrivilegedAction;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
-import org.apache.rocketmq.common.UtilAll;
-import org.apache.rocketmq.common.constant.LoggerName;
-import org.apache.rocketmq.logging.InternalLogger;
-import org.apache.rocketmq.logging.InternalLoggerFactory;
-import org.apache.rocketmq.common.message.MessageExt;
-import org.apache.rocketmq.common.message.MessageExtBatch;
-import org.apache.rocketmq.store.config.FlushDiskType;
-import org.apache.rocketmq.store.util.LibC;
-import sun.nio.ch.DirectBuffer;
 
 public class MappedFile extends ReferenceResource {
+    // 操作系统每页大小,默认4K
     public static final int OS_PAGE_SIZE = 1024 * 4;
+
     protected static final InternalLogger log = InternalLoggerFactory.getLogger(LoggerName.STORE_LOGGER_NAME);
 
+    // 当前JVM实例中Mapped-File虚拟内存
     private static final AtomicLong TOTAL_MAPPED_VIRTUAL_MEMORY = new AtomicLong(0);
 
+    // 当前JVM实例中MappedFile对象个数
     private static final AtomicInteger TOTAL_MAPPED_FILES = new AtomicInteger(0);
+
+    // 当前文件的写指针,从0开始(内存映射文件的写指针)
     protected final AtomicInteger wrotePosition = new AtomicInteger(0);
+
+    // 当前文件的提交指针,如果开启transientStorePoolEnable,则数据会存储在TransientStorePool中,然后提交到内存映射ByteBuffer中,再刷写到磁盘
     protected final AtomicInteger committedPosition = new AtomicInteger(0);
+
+    // 刷写到磁盘指针,该指针之前的数据持久化到磁盘
     private final AtomicInteger flushedPosition = new AtomicInteger(0);
+
+    // 文件大小
     protected int fileSize;
+
+    // 文件通道
     protected FileChannel fileChannel;
     /**
      * Message will put to here first, and then reput to FileChannel if writeBuffer is not null.
      */
+    // 堆内存ByteBuffer,如果不为空,数据首先将存储在该Buffer中,然后提交到MappedFile对应的内存映射文件Buffer。transientStorePoolEnable为true时不为空
     protected ByteBuffer writeBuffer = null;
+
+    // 堆内存池,transientStorePoolEnable为true时启用
     protected TransientStorePool transientStorePool = null;
+
+    // 文件名称
     private String fileName;
+
+    // 该文件的初始偏移量
     private long fileFromOffset;
+
+    // 物理文件
     private File file;
+
+    // 物理文件对应的内存映射Buffer
     private MappedByteBuffer mappedByteBuffer;
+
+    // 文件最后一次写入的时间
     private volatile long storeTimestamp = 0;
+
+    // 是否是MappedFileQueue队列中的第一个文件
     private boolean firstCreateInQueue = false;
 
     public MappedFile() {
@@ -158,6 +188,7 @@ public class MappedFile extends ReferenceResource {
         ensureDirOK(this.file.getParent());
 
         try {
+            // 通过RandomAccessFile创建读写通道
             this.fileChannel = new RandomAccessFile(this.file, "rw").getChannel();
             this.mappedByteBuffer = this.fileChannel.map(MapMode.READ_WRITE, 0, fileSize);
             TOTAL_MAPPED_VIRTUAL_MEMORY.addAndGet(fileSize);
@@ -276,6 +307,7 @@ public class MappedFile extends ReferenceResource {
                 try {
                     //We only append data to fileChannel or mappedByteBuffer, never both.
                     if (writeBuffer != null || this.fileChannel.position() != 0) {
+                        // 将内存中的数据持久化到磁盘
                         this.fileChannel.force(false);
                     } else {
                         this.mappedByteBuffer.force();
@@ -294,6 +326,11 @@ public class MappedFile extends ReferenceResource {
         return this.getFlushedPosition();
     }
 
+    /**
+     * 提交操作 commit的作用就是将writeBuffer中的数据提交到文件通道FileChannel中
+     * @param commitLeastPages 本次提交的最小页数
+     * @return
+     */
     public int commit(final int commitLeastPages) {
         if (writeBuffer == null) {
             //no need to commit data to file channel, so just regard wrotePosition as committedPosition.
@@ -438,6 +475,7 @@ public class MappedFile extends ReferenceResource {
     public boolean destroy(final long intervalForcibly) {
         this.shutdown(intervalForcibly);
 
+        // 清理完成,关闭文件通道,删除物理文件
         if (this.isCleanupOver()) {
             try {
                 this.fileChannel.close();
@@ -471,6 +509,8 @@ public class MappedFile extends ReferenceResource {
     }
 
     /**
+     * 如果writeBuffer不为空flushedPosition等于committedPosition,因为上次提交的数据就是进入到MappedByteBuffer中的数据
+     * 如果为空 flushedPosition等于wrotePosition,因为数据直接进入到MappedByteBuffer,wrotePosition代表MappedByteBuffer的指针
      * @return The max position which have valid data
      */
     public int getReadPosition() {

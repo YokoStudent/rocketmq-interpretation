@@ -40,6 +40,9 @@ public abstract class ReferenceResource {
         return this.available;
     }
 
+    /**
+     * @param intervalForcibly  最大拒绝存活期
+     */
     public void shutdown(final long intervalForcibly) {
         if (this.available) {
             this.available = false;
